@@ -1,0 +1,181 @@
+# obtainFreshBeanFactory
+
+
+
+## 入口简介
+
+obtainFreshBeanFactory 方法是 refresh 中第一个重量级方法，也是通过不同的调用者去实现具体的功能，先看下具体可以发生的调用： 
+
+·「
+
+具体调用那个就要看一下你当前spring入口的形式了：
+
+- GenericApplicationContext 的实现类
+
+  撒
+
+- AbstractRefreshableApplicationContext 的实现类
+
+  21
+
+  
+
+因为我当前使用传统tomcat方式启动，我的入口为 XMLWebApplicationContext，所以我会使用AbstractRefreshableApplicationContext 的 refreshBeanFactory，下文也以此为引线讲解。
+
+
+
+## refreshBeanFactory 方法
+
+在obtainFreshBeanFactory 中调用了 refreshBeanFactory，
+
+```java
+	@Override
+	protected final void refreshBeanFactory() throws BeansException {
+        // 干掉已经存在的BeanFactory
+		if (hasBeanFactory()) {
+			destroyBeans();
+			closeBeanFactory();
+		}
+		try {
+            // new一个DefaultListableBeanFactory，并运用设置 parent 为 null
+			DefaultListableBeanFactory beanFactory = createBeanFactory();
+			beanFactory.setSerializationId(getId());
+            // 设置是否允许 BD覆盖，循环引用
+			customizeBeanFactory(beanFactory);
+            // 读取BD，重头戏，见下一节
+			loadBeanDefinitions(beanFactory);
+			synchronized (this.beanFactoryMonitor) {
+				this.beanFactory = beanFactory;
+			}
+		}
+		catch (IOException ex) {
+			throw new ApplicationContextException("I/O error parsing bean definition source for " + getDisplayName(), ex);
+		}
+	}
+```
+
+
+
+## loadBeanDefinitions 方法
+
+该方法根据不同入口有几个不同实现，如下：
+
+pic
+
+我们使用 XmlWebApplicationContext 的实现，内部无太多可看的方式，基本就是根据配置类解析加载XML配置文件，然后通过XmlBeanDefinitionReader去读取BD到容器：
+
+org.springframework.beans.factory.xml.XmlBeanDefinitionReader#loadBeanDefinitions(org.springframework.core.io.support.EncodedResource)
+
+```java
+public int loadBeanDefinitions(EncodedResource encodedResource) throws BeanDefinitionStoreException {
+		Assert.notNull(encodedResource, "EncodedResource must not be null");
+		if (logger.isInfoEnabled()) {
+			logger.info("Loading XML bean definitions from " + encodedResource.getResource());
+		}
+		// 尝试从当前ThreadLocal中获取读取的xml资源集合
+		Set<EncodedResource> currentResources = this.resourcesCurrentlyBeingLoaded.get();
+		if (currentResources == null) {
+			currentResources = new HashSet<EncodedResource>(4);
+			this.resourcesCurrentlyBeingLoaded.set(currentResources);
+		}
+    	// 当前threadlocal如果存在正在准备读取的xml文件，则说明有循环引入问题，拒绝继续执行问题
+   		// 请你思考为什么用threadlocal处理
+		if (!currentResources.add(encodedResource)) {
+			throw new BeanDefinitionStoreException(
+					"Detected cyclic loading of " + encodedResource + " - check your import definitions!");
+		}
+		try {
+			InputStream inputStream = encodedResource.getResource().getInputStream();
+			try {
+				InputSource inputSource = new InputSource(inputStream);
+				if (encodedResource.getEncoding() != null) {
+					inputSource.setEncoding(encodedResource.getEncoding());
+				}
+                // 真实的读取和注册BD
+				return doLoadBeanDefinitions(inputSource, encodedResource.getResource());
+			}
+			finally {
+				inputStream.close();
+			}
+		}
+		catch (IOException ex) {
+			throw new BeanDefinitionStoreException(
+					"IOException parsing XML document from " + encodedResource.getResource(), ex);
+		}
+		finally {
+			currentResources.remove(encodedResource);
+			if (currentResources.isEmpty()) {
+				this.resourcesCurrentlyBeingLoaded.remove();
+			}
+		}
+	}
+```
+
+#### 为什么使用threadlocal处理xml的循环依赖
+
+我当前（200714）认为：
+
+在XmlBeanDefinitionReader#loadBeanDefinitions内，要读取到所有xml的import路径并解析为资源文件，可能会出现 A.xml import了B.xml，而B.xml import了A.xml，我们第一想法是，设定一个XmlBeanDefinitionReader的private static的集合，每次放入都看下集合是否存在这个路径，存在则抛异常。
+
+然而spring并非用这样方式处理，#loadBeanDefinitions做的业务是读取注册BeanDefinition，方式是通过深度递归的方式解析标签。其在 #doLoadBeanDefinitions中判断出现import标签，如果出现了import，则会递归再次调用#loadBeanDefinitions ，直到获取到真正的beanDefnitions，注册后才进行返回。
+
+然而spring是允许你进行多次import的相同的文件的，只是循环依赖是禁止的。
+
+另外，XmlBeanDefinitionReader的实例化方式是new，而且是可能被不同的位置所使用的，比如spring-jdbc等，????????????
+
+
+
+## doLoadBeanDefinitions 真正读取和注册BD
+
+doLoadBeanDefinitions只做了两件事：
+
+- 读取XML为Document对象
+
+- 将这个Document对象注册为BeanDefinition
+
+  所谓注册就是递归调用
+  
+  ```
+  DefaultNamespaceHandlerResolver
+  ```
+  
+  ```java
+  	public BeanDefinition parseCustomElement(Element ele, BeanDefinition containingBd) {
+  		String namespaceUri = getNamespaceURI(ele);
+  		NamespaceHandler handler = this.readerContext.getNamespaceHandlerResolver().resolve(namespaceUri);
+  		if (handler == null) {
+  			error("Unable to locate Spring NamespaceHandler for XML schema namespace [" + namespaceUri + "]", ele);
+  			return null;
+  		}
+  		return handler.parse(ele, new ParserContext(this.readerContext, this, containingBd));
+  	}
+  ```
+  
+  
+  
+  
+  
+  最后使用ComponentScanBeanDefinitionParser的XXX
+  
+  ```java
+  	@Override
+  	public BeanDefinition parse(Element element, ParserContext parserContext) {
+  		String basePackage = element.getAttribute(BASE_PACKAGE_ATTRIBUTE);
+  		basePackage = parserContext.getReaderContext().getEnvironment().resolvePlaceholders(basePackage);
+  		String[] basePackages = StringUtils.tokenizeToStringArray(basePackage,
+  				ConfigurableApplicationContext.CONFIG_LOCATION_DELIMITERS);
+  
+  		// Actually scan for bean definitions and register them.
+  		ClassPathBeanDefinitionScanner scanner = configureScanner(parserContext, element);
+  		Set<BeanDefinitionHolder> beanDefinitions = scanner.doScan(basePackages);
+  		registerComponents(parserContext.getReaderContext(), beanDefinitions, element);
+  
+  		return null;
+  	}
+  ```
+  
+  
+
+
+
+​	
